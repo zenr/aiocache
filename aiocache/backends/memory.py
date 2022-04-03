@@ -1,5 +1,8 @@
+import sys
 import asyncio
-from typing import Dict
+from typing import Dict, Tuple
+
+from collections import OrderedDict
 
 from aiocache.base import BaseCache
 from aiocache.serializers import NullSerializer
@@ -10,14 +13,19 @@ class SimpleMemoryBackend:
     Wrapper around dict operations to use it as a cache backend
     """
 
-    _cache: Dict[str, object] = {}
+    _cache: Dict[str, Tuple[int, object]] = OrderedDict([])
     _handlers: Dict[str, asyncio.TimerHandle] = {}
+    _total_sizeof = 0
 
     def __init__(self, **kwargs):
+        max_size=100000
+        self.max_size = max_size
         super().__init__(**kwargs)
 
     async def _get(self, key, encoding="utf-8", _conn=None):
-        return SimpleMemoryBackend._cache.get(key)
+        SimpleMemoryBackend._cache.move_to_end(key, last=True)
+        _, value = SimpleMemoryBackend._cache.get(key)
+        return value
 
     async def _gets(self, key, encoding="utf-8", _conn=None):
         return await self._get(key, encoding=encoding, _conn=_conn)
@@ -29,10 +37,13 @@ class SimpleMemoryBackend:
         if _cas_token is not None and _cas_token != SimpleMemoryBackend._cache.get(key):
             return 0
 
+        sizeof = sys.getsizeof(value)
+        SimpleMemoryBackend._total_sizeof += sizeof
+        
         if key in SimpleMemoryBackend._handlers:
             SimpleMemoryBackend._handlers[key].cancel()
 
-        SimpleMemoryBackend._cache[key] = value
+        SimpleMemoryBackend._cache[key] = (sizeof, value)
         if ttl:
             loop = asyncio.get_event_loop()
             SimpleMemoryBackend._handlers[key] = loop.call_later(ttl, self.__delete, key)
@@ -55,7 +66,7 @@ class SimpleMemoryBackend:
 
     async def _increment(self, key, delta, _conn=None):
         if key not in SimpleMemoryBackend._cache:
-            SimpleMemoryBackend._cache[key] = delta
+            SimpleMemoryBackend._cache[key] = (sys.getsizeof(delta), delta)
         else:
             try:
                 SimpleMemoryBackend._cache[key] = int(SimpleMemoryBackend._cache[key]) + delta
@@ -106,7 +117,25 @@ class SimpleMemoryBackend:
             return 1
 
         return 0
-
+    
+    def __len__(self):
+        return len(SimpleMemoryBackend._cache)
+    
+    def remove(self):
+        '''
+        Keep removing elements from the start until the total size is 
+        less than 70% of max_size.
+        '''
+        for key, size_value in SimpleMemoryBackend._cache.items():
+            size, value = size_value
+            if SimpleMemoryBackend._total_sizeof - size >= 0.7*self.max_size:
+                if key in SimpleMemoryBackend._handlers:
+                    SimpleMemoryBackend._handlers[key].cancel()
+                SimpleMemoryBackend._total_sizeof -= size
+                SimpleMemoryBackend._cache.pop(key)
+                
+    def __sizeof__(self):
+        return SimpleMemoryBackend._total_sizeof
 
 class SimpleMemoryCache(SimpleMemoryBackend, BaseCache):
     """
